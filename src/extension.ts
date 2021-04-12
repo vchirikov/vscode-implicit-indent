@@ -2,10 +2,13 @@ import * as vscode from "vscode";
 import { Mutex } from "async-mutex";
 import { Position, TextEditorSelectionChangeEvent } from "vscode";
 
-export declare let previous_line_number_from_click: number | undefined;
+export declare let prevClickLine: number | undefined;
 export declare let lock: Mutex;
 
-export function deactivate() {}
+const options = { undoStopAfter: false, undoStopBefore: false };
+
+export function deactivate() { }
+
 export function activate(context: vscode.ExtensionContext) {
   // Because we use await in our async functions, we need a mutex/lock to
   // prevent concurrent executions of any of our movement commands.
@@ -23,9 +26,9 @@ export function activate(context: vscode.ExtensionContext) {
     const disposable = vscode.commands.registerCommand(name, async () => {
       // Get the cursor's current line and check if it is empty.
       const editor = vscode.window.activeTextEditor!;
-      const cursorPos = editor.selection.start;
-      const cursorLine = cursorPos.line;
-      await executeIndent(editor, cursorPos, cursorLine, moveCommand);
+      const position = editor.selection.start;
+      const line = position.line;
+      await executeIndentAndClear(editor, position, line, moveCommand);
     });
     context.subscriptions.push(disposable);
   });
@@ -34,56 +37,76 @@ export function activate(context: vscode.ExtensionContext) {
     async (event: TextEditorSelectionChangeEvent) => {
       // Get the cursor's current line and check if it is empty.
       const editor = vscode.window.activeTextEditor!;
-      const cursorPos = editor.selection.start;
-      const cursorLine = cursorPos.line;
-      if (previous_line_number_from_click == cursorLine) {
+      const position = editor.selection.start;
+      const line = position.line;
+      if (prevClickLine == line) {
         return;
       }
 
-      await executeIndent(editor, cursorPos, cursorLine, "");
-      previous_line_number_from_click = cursorLine;
+      await executeIndentAndClear(editor, position, line, "");
+      prevClickLine = line;
     }
   );
 }
 
-async function executeIndent(
+async function executeIndentAndClear(
   editor: vscode.TextEditor,
-  cursorPos: Position,
-  cursorLine: number,
+  position: Position,
+  line: number,
   moveCommand: string
 ) {
   // First, wait to acquire the lock before doing anything.
   const releaseLock = await lock.acquire();
   try {
+
+    const document = editor.document;
+    const isMouseCommand = moveCommand === "";
+    const prevLineText = editor.document.lineAt(line);
+
+    // We will remove spaces in whitespace-only lines only after keys movements
+    let shouldDeletePrevLineWhitespace = !isMouseCommand && prevLineText.text !== "" && prevLineText.isEmptyOrWhitespace;
+    let indent = 0;
+
     // Execute the underlying movement command associated with this command.
-    if (moveCommand) {
+    if (!isMouseCommand) {
       await vscode.commands.executeCommand(moveCommand);
     }
 
-    let cursorLineText = editor.document.lineAt(cursorLine).text;
-    if (cursorLineText === "") {
-      // Find the next line that is not empty or whitespace-only.
-      let nextLine = cursorLine;
-      var nextLineText;
+    const newPosition = isMouseCommand ? position : editor.selection.start;
+    const newLine = newPosition.line;
+    let newLineText = isMouseCommand ? prevLineText.text : document.lineAt(newLine).text;
+
+    if (newLineText === '') {
       try {
-        nextLineText = editor.document.lineAt(nextLine).text;
-        while (/\S/.test(nextLineText) === false) {
-          nextLine = nextLine + 1;
-          nextLineText = editor.document.lineAt(nextLine).text;
+        for (let i = newLine + 1; i < document.lineCount; ++i) {
+          const line = document.lineAt(i);
+          if (line.isEmptyOrWhitespace) {
+            continue;
+          }
+          indent = line.firstNonWhitespaceCharacterIndex;
+          break;
         }
       } catch (e) {
-        nextLineText = "";
+        indent = 0;
       }
 
-      // Figure out the indentation level of that next line,
-      // and copy it here to the cursor line.
-      const nextLineIndent = nextLineText.match(/^\s*/)![0]!;
-      editor.edit((edit) => {
-        edit.insert(cursorPos, nextLineIndent);
-      });
+      if (indent > 0) {
+        editor.edit((edit) => {
+          // don't use edit.replace here because it doesn't use forceMoveMarkers
+          if (shouldDeletePrevLineWhitespace) {
+            edit.delete(prevLineText.range);
+          }
+          edit.insert(newPosition, ' '.repeat(indent));
+        }, options);
+      }
     }
+    else if (indent == 0 && shouldDeletePrevLineWhitespace) {
+      editor.edit((edit) => {
+        edit.delete(prevLineText.range);
+      }, options);
+    }
+
   } finally {
-    // Always release the lock at the end of this block.
     releaseLock();
   }
 }
